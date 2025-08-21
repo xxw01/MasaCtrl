@@ -64,7 +64,11 @@ class MutualSelfAttentionControl(AttentionBase):
         ku, kc = k.chunk(2)
         vu, vc = v.chunk(2)
         attnu, attnc = attn.chunk(2)
-
+        
+        print("shape of qu:", qu.shape)
+        print("shape of ku[:num_heads]:", ku[:num_heads].shape)
+        print("shape of vu[:num_heads]:", vu[:num_heads].shape)
+        
         out_u = self.attn_batch(qu, ku[:num_heads], vu[:num_heads], sim[:num_heads], attnu, is_cross, place_in_unet, num_heads, **kwargs)
         out_c = self.attn_batch(qc, kc[:num_heads], vc[:num_heads], sim[:num_heads], attnc, is_cross, place_in_unet, num_heads, **kwargs)
         out = torch.cat([out_u, out_c], dim=0)
