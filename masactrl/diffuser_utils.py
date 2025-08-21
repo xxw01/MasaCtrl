@@ -181,6 +181,9 @@ class MasaCtrlPipeline(StableDiffusionPipeline):
                 _, text_embeddings = text_embeddings.chunk(2)
                 text_embeddings = torch.cat([unconditioning[i].expand(*text_embeddings.shape), text_embeddings]) 
             # predict tghe noise
+            
+            print("shape of model inputs:", model_inputs.shape)
+            
             noise_pred = self.unet(model_inputs, t, encoder_hidden_states=text_embeddings).sample
             if guidance_scale > 1.:
                 noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
