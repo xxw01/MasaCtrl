@@ -97,6 +97,7 @@ def regiter_attention_editor_diffusers(model, editor: AttentionBase):
             else:
                 to_out = self.to_out
 
+            print("shape of x:", x.shape)
             h = self.heads
             q = self.to_q(x)
             is_cross = context is not None
@@ -104,6 +105,9 @@ def regiter_attention_editor_diffusers(model, editor: AttentionBase):
             k = self.to_k(context)
             v = self.to_v(context)
             q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+            print("shape of q:", q.shape)
+            print("shape of k:", k.shape)
+            print("shape of v:", v.shape)
 
             sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
 
@@ -119,7 +123,9 @@ def regiter_attention_editor_diffusers(model, editor: AttentionBase):
             out = editor(
                 q, k, v, sim, attn, is_cross, place_in_unet,
                 self.heads, scale=self.scale)
-
+            
+            print("shape of out:", out.shape)
+            
             return to_out(out)
 
         return forward
