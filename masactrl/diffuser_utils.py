@@ -203,7 +203,7 @@ class MasaCtrlPipeline(StableDiffusionPipeline):
                 noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
                 noise_pred = noise_pred_uncon + guidance_scale * (noise_pred_con - noise_pred_uncon)
             # compute the previous noise sample x_t -> x_t-1
-            latents, pred_x0 = self.step(noise_pred, t, latents)
+            latents, pred_x0 = self.step(noise_pred, t, latents, eta)
             latents_list.append(latents)
             pred_x0_list.append(pred_x0)
 
