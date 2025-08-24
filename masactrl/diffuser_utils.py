@@ -59,9 +59,23 @@ class MasaCtrlPipeline(StableDiffusionPipeline):
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
         alpha_prod_t_prev = self.scheduler.alphas_cumprod[prev_timestep] if prev_timestep > 0 else self.scheduler.final_alpha_cumprod
         beta_prod_t = 1 - alpha_prod_t
+
+        # posterior variance
+        posterior_variance = (1.0 - (alpha_prod_t / alpha_prod_t_prev)) * (1.0 - alpha_prod_t_prev) / (1.0 - alpha_prod_t)
+        posterior_variance = max(posterior_variance, 1e-20)  # 数值稳定
+        posterior_std = posterior_variance**0.5
         pred_x0 = (x - beta_prod_t**0.5 * model_output) / alpha_prod_t**0.5
-        pred_dir = (1 - alpha_prod_t_prev)**0.5 * model_output
-        x_prev = alpha_prod_t_prev**0.5 * pred_x0 + pred_dir
+        pred_dir = (1 - alpha_prod_t_prev - eta**2 * posterior_variance)**0.5 * model_output
+        if prev_timestep > 0:
+            noise = torch.randn_like(x)
+            x_prev = alpha_prod_t_prev**0.5 * pred_x0 + pred_dir + eta * posterior_std * noise
+        else:
+            # t == 0 (或映射到最末步) 时不加随机噪声
+            x_prev = pred_x0
+        
+        # pred_x0 = (x - beta_prod_t**0.5 * model_output) / alpha_prod_t**0.5
+        # pred_dir = (1 - alpha_prod_t_prev)**0.5 * model_output
+        # x_prev = alpha_prod_t_prev**0.5 * pred_x0 + pred_dir
         return x_prev, pred_x0
 
     @torch.no_grad()
