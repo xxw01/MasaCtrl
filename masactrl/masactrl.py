@@ -208,8 +208,8 @@ class MutualSelfAttentionControlMaskAuto(MutualSelfAttentionControl):
             step_idx: list the steps to apply mutual self-attention control
             total_steps: the total number of steps
             thres: the thereshold for mask thresholding
-            ref_token_idx: the token index list for cross-attention map aggregation
-            cur_token_idx: the token index list for cross-attention map aggregation
+            ref_token_idx: the token index list for cross-attention map aggregation(source mask)
+            cur_token_idx: the token index list for cross-attention map aggregation(target mask)
             mask_save_dir: the path to save the mask image
         """
         super().__init__(start_step, start_layer, layer_idx, step_idx, total_steps, model_type)
