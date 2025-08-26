@@ -262,7 +262,7 @@ class MutualSelfAttentionControlMaskAuto(MutualSelfAttentionControl):
         return out
 
     def aggregate_cross_attn_map(self, idx):
-        attn_map = torch.stack(self.cross_attns, dim=1).mean(1)  # (B, N, dim)
+        attn_map = torch.stack(self.cross_attns, dim=1).mean(1)  # torch.stack(..., dim=1) → (B, S, N, dim), .mean(1) → (B, N, dim)
         B = attn_map.shape[0]
         res = int(np.sqrt(attn_map.shape[-2]))
         attn_map = attn_map.reshape(-1, res, res, attn_map.shape[-1])
