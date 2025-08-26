@@ -272,7 +272,7 @@ class MutualSelfAttentionControlMaskAuto(MutualSelfAttentionControl):
         image_min = image.min(dim=1, keepdim=True)[0].min(dim=2, keepdim=True)[0]
         image_max = image.max(dim=1, keepdim=True)[0].max(dim=2, keepdim=True)[0]
         image = (image - image_min) / (image_max - image_min)
-        return image
+        return image #(B, res, res)
 
     def forward(self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs):
         """
