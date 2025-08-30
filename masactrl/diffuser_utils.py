@@ -71,7 +71,7 @@ class MasaCtrlPipeline(StableDiffusionPipeline):
             x_prev = alpha_prod_t_prev**0.5 * pred_x0 + pred_dir + eta * posterior_std * noise
         else:
             # t == 0 (或映射到最末步) 时不加随机噪声
-            x_prev = pred_x0
+            x_prev = alpha_prod_t_prev**0.5 * pred_x0 
         
         # pred_x0 = (x - beta_prod_t**0.5 * model_output) / alpha_prod_t**0.5
         # pred_dir = (1 - alpha_prod_t_prev)**0.5 * model_output
