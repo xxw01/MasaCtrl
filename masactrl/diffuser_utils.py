@@ -81,7 +81,7 @@ class MasaCtrlPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def image2latent(self, image):
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        if type(image) is Image:
+        if isinstance(image, Image.Image):
             image = np.array(image)
             image = torch.from_numpy(image).float() / 127.5 - 1
             image = image.permute(2, 0, 1).unsqueeze(0).to(DEVICE)
@@ -213,6 +213,175 @@ class MasaCtrlPipeline(StableDiffusionPipeline):
             latents_list = [self.latent2image(img, return_type="pt") for img in latents_list]
             return image, pred_x0_list, latents_list
         return image
+
+    @torch.no_grad()
+    def __call_three_path__(
+        self,
+        source_prompt,
+        target_prompt,
+        batch_size=1,
+        height=512,
+        width=512,
+        num_inference_steps=50,
+        guidance_scale=7.5,
+        eta=0.0,
+        latents_s=None,
+        latents_t=None,
+        latents_m=None,
+        unconditioning=None,
+        neg_prompt=None,
+        ref_intermediate_latents=None,
+        return_intermediates=False,
+        editability_weight=1.0,  # ws parameter
+        **kwds):
+        """
+        Three-path processing for MasaCtrl editability enhancement.
+        
+        Args:
+            source_prompt: prompt for source reconstruction (Ls path)
+            target_prompt: prompt for target editing (Lt and Lm paths)
+            latents_s: initial latents for source path (Ls)
+            latents_t: initial latents for target path (Lt)  
+            latents_m: initial latents for editability path (Lm)
+            editability_weight: ws parameter for noise update strategy
+        """
+        DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        
+        # Process prompts
+        if isinstance(source_prompt, str):
+            source_prompt = [source_prompt] * batch_size
+        if isinstance(target_prompt, str):
+            target_prompt = [target_prompt] * batch_size
+
+        # Text embeddings for source prompt (Ls path)
+        source_text_input = self.tokenizer(
+            source_prompt,
+            padding="max_length",
+            max_length=77,
+            return_tensors="pt"
+        )
+        source_text_embeddings = self.text_encoder(source_text_input.input_ids.to(DEVICE))[0]
+        
+        # Text embeddings for target prompt (Lt and Lm paths)
+        target_text_input = self.tokenizer(
+            target_prompt,
+            padding="max_length",
+            max_length=77,
+            return_tensors="pt"
+        )
+        target_text_embeddings = self.text_encoder(target_text_input.input_ids.to(DEVICE))[0]
+        
+        print("source text embeddings shape:", source_text_embeddings.shape)
+        print("target text embeddings shape:", target_text_embeddings.shape)
+
+        # Define initial latents
+        latents_shape = (batch_size, self.unet.in_channels, height//8, width//8)
+        if latents_s is None:
+            latents_s = torch.randn(latents_shape, device=DEVICE)
+        if latents_t is None:
+            latents_t = torch.randn(latents_shape, device=DEVICE)
+        if latents_m is None:
+            latents_m = torch.randn(latents_shape, device=DEVICE)
+
+        # Unconditional embedding for classifier free guidance
+        if guidance_scale > 1.:
+            if neg_prompt:
+                uc_text = neg_prompt
+            else:
+                uc_text = ""
+            unconditional_input = self.tokenizer(
+                [uc_text] * batch_size,
+                padding="max_length",
+                max_length=77,
+                return_tensors="pt"
+            )
+            unconditional_embeddings = self.text_encoder(unconditional_input.input_ids.to(DEVICE))[0]
+            
+            # Prepare text embeddings for three paths:
+            # [uncond_s, uncond_t, uncond_m, cond_s, cond_t, cond_m]
+            text_embeddings = torch.cat([
+                unconditional_embeddings,  # uncond for source
+                unconditional_embeddings,  # uncond for target 
+                unconditional_embeddings,  # uncond for editability
+                source_text_embeddings,    # cond for source
+                target_text_embeddings,    # cond for target
+                target_text_embeddings,    # cond for editability (uses target prompt)
+            ], dim=0)
+        else:
+            # Without CFG: [cond_s, cond_t, cond_m]
+            text_embeddings = torch.cat([
+                source_text_embeddings,
+                target_text_embeddings,
+                target_text_embeddings,  # Lm uses target prompt
+            ], dim=0)
+
+        print("combined text embeddings shape:", text_embeddings.shape)
+        print("latents_s shape:", latents_s.shape)
+        print("latents_t shape:", latents_t.shape)
+        print("latents_m shape:", latents_m.shape)
+
+        # Iterative sampling
+        self.scheduler.set_timesteps(num_inference_steps)
+        latents_s_list = [latents_s]
+        latents_t_list = [latents_t]
+        latents_m_list = [latents_m]
+        
+        for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="Three-Path DDIM Sampler")):
+            # Combine all latents for processing: [latents_s, latents_t, latents_m]
+            combined_latents = torch.cat([latents_s, latents_t, latents_m], dim=0)
+            
+            if guidance_scale > 1.:
+                # Duplicate for CFG: [latents_s, latents_t, latents_m, latents_s, latents_t, latents_m]
+                model_inputs = torch.cat([combined_latents] * 2)
+            else:
+                model_inputs = combined_latents
+
+            print(f"Step {i}, model_inputs shape:", model_inputs.shape)
+            
+            # Predict noise for all paths
+            noise_pred = self.unet(model_inputs, t, encoder_hidden_states=text_embeddings).sample
+            
+            if guidance_scale > 1.:
+                # Split unconditional and conditional predictions
+                noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
+                noise_pred = noise_pred_uncon + guidance_scale * (noise_pred_con - noise_pred_uncon)
+            
+            # Split noise predictions for each path
+            noise_pred_s, noise_pred_t, noise_pred_m = noise_pred.chunk(3, dim=0)
+            
+            # Apply editability enhancement: et = em + ws * (et - em)
+            # This makes the target editing move away from the editability path
+            noise_pred_t_enhanced = noise_pred_m + editability_weight * (noise_pred_t - noise_pred_m)
+            
+            # Compute next latents for each path
+            latents_s, _ = self.step(noise_pred_s, t, latents_s, eta)
+            latents_t, _ = self.step(noise_pred_t_enhanced, t, latents_t, eta)
+            latents_m, _ = self.step(noise_pred_m, t, latents_m, eta)
+            
+            latents_s_list.append(latents_s)
+            latents_t_list.append(latents_t)
+            latents_m_list.append(latents_m)
+
+        # Convert final latents to images
+        image_s = self.latent2image(latents_s, return_type="pt")
+        image_t = self.latent2image(latents_t, return_type="pt")
+        image_m = self.latent2image(latents_m, return_type="pt")
+        
+        if return_intermediates:
+            return {
+                'source': image_s,
+                'target': image_t, 
+                'editability': image_m,
+                'latents_s_list': latents_s_list,
+                'latents_t_list': latents_t_list,
+                'latents_m_list': latents_m_list
+            }
+        
+        return {
+            'source': image_s,
+            'target': image_t,
+            'editability': image_m
+        }
 
     @torch.no_grad()
     def invert(
