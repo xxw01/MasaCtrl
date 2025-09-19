@@ -18,13 +18,15 @@ def register_attention_processor(
     """
     Args:
         model: a unet model or a list of unet models
-        processor_type: the type of the processor
+        processor_type: the type of the processor. Options: "MasaCtrlProcessor", "MasaCtrlEditabilityProcessor"
     """
     if not isinstance(model, (list, tuple)):
         model = [model]
 
     if processor_type == "MasaCtrlProcessor":
         processor = MasaCtrlProcessor(**attn_args)
+    elif processor_type == "MasaCtrlEditabilityProcessor":
+        processor = MasaCtrlEditabilityProcessor(**attn_args)
     else:
         processor = AttnProcessor()
 
@@ -234,6 +236,202 @@ class MasaCtrlProcessor(nn.Module):
         # mutual self-attention control
         if not is_cross and self.cur_step in self.step_idx and cur_transformer_layer in self.layer_idx:
             query, key, value = self.masactrl_forward(query, key, value)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states, *args)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+
+class MasaCtrlEditabilityProcessor(nn.Module):
+    """
+    Editability-enhanced Mutual Self-attention Processor for three-path processing.
+    Implements the enhanced MasaCtrl with Ls, Lt, and Lm paths for improved editability.
+    """
+    MODEL_TYPE = {
+        "SD": 16,
+        "SDXL": 70
+    }
+    
+    def __init__(self, start_step=4, start_layer=10, layer_idx=None, step_idx=None, total_layers=32, total_steps=50, model_type="SD"):
+        """
+        Editability-enhanced mutual self-attention control for Stable-Diffusion model
+        Args:
+            start_step: the step to start mutual self-attention control
+            start_layer: the layer to start mutual self-attention control
+            layer_idx: list of the layers to apply mutual self-attention control
+            step_idx: list the steps to apply mutual self-attention control
+            total_steps: the total number of steps, must be same to the denoising steps used in denoising scheduler
+            model_type: the model type, SD or SDXL
+        """
+        super().__init__()
+        self.total_steps = total_steps
+        self.total_layers = self.MODEL_TYPE.get(model_type, 16)
+        self.start_step = start_step
+        self.start_layer = start_layer
+        self.layer_idx = layer_idx if layer_idx is not None else list(range(start_layer, self.total_layers))
+        self.step_idx = step_idx if step_idx is not None else list(range(start_step, total_steps))
+        print("MasaCtrlEditability at denoising steps: ", self.step_idx)
+        print("MasaCtrlEditability at U-Net layers: ", self.layer_idx)
+
+        self.cur_step = 0
+        self.cur_att_layer = 0
+        self.num_attn_layers = total_layers
+
+    def after_step(self):
+        pass
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        temb: Optional[torch.FloatTensor] = None,
+        scale: float = 1.0,
+    ):
+        out = self.attn_forward(
+            attn,
+            hidden_states,
+            encoder_hidden_states,
+            attention_mask,
+            temb,
+            scale,
+        )
+        self.cur_att_layer += 1
+        if self.cur_att_layer == self.num_attn_layers:
+            self.cur_att_layer = 0
+            self.cur_step += 1
+            self.cur_step %= self.total_steps
+            # after step
+            self.after_step()
+        return out
+
+    def masactrl_editability_forward(
+        self,
+        query,
+        key,
+        value,
+    ):
+        """
+        Three-path attention control for editability enhancement:
+        - Ls path: source reconstruction (unconditional + conditional source)
+        - Lt path: target editing with Qt attending to source Ks, Vs
+        - Lm path: editability enhancement using source Qs, Ks with own Vm
+        """
+        # Expected input format: [ku_s, ku_t, ku_m, kc_s, kc_t, kc_m] (6 chunks for CFG)
+        # Or [kc_s, kc_t, kc_m] (3 chunks without CFG)
+        
+        if query.shape[0] == 6:  # CFG case
+            qu_s, qu_t, qu_m, qc_s, qc_t, qc_m = query.chunk(6)
+            ku_s, ku_t, ku_m, kc_s, kc_t, kc_m = key.chunk(6)
+            vu_s, vu_t, vu_m, vc_s, vc_t, vc_m = value.chunk(6)
+            
+            # Three-path logic:
+            # Ls: keep original (source reconstruction)
+            q_ls_u, k_ls_u, v_ls_u = qu_s, ku_s, vu_s
+            q_ls_c, k_ls_c, v_ls_c = qc_s, kc_s, vc_s
+            
+            # Lt: Qt attends to source Ks, Vs
+            q_lt_u, k_lt_u, v_lt_u = qu_t, ku_s, vu_s  # Use source K,V
+            q_lt_c, k_lt_c, v_lt_c = qc_t, kc_s, vc_s  # Use source K,V
+            
+            # Lm: Use source Qs, Ks with own Vm
+            q_lm_u, k_lm_u, v_lm_u = qu_s, ku_s, vu_m  # Use source Q,K, own V
+            q_lm_c, k_lm_c, v_lm_c = qc_s, kc_s, vc_m  # Use source Q,K, own V
+            
+            q_rearranged = torch.cat([q_ls_u, q_lt_u, q_lm_u, q_ls_c, q_lt_c, q_lm_c])
+            k_rearranged = torch.cat([k_ls_u, k_lt_u, k_lm_u, k_ls_c, k_lt_c, k_lm_c])
+            v_rearranged = torch.cat([v_ls_u, v_lt_u, v_lm_u, v_ls_c, v_lt_c, v_lm_c])
+            
+        else:  # No CFG case (3 chunks)
+            qc_s, qc_t, qc_m = query.chunk(3)
+            kc_s, kc_t, kc_m = key.chunk(3)
+            vc_s, vc_t, vc_m = value.chunk(3)
+            
+            # Three-path logic:
+            # Ls: keep original (source reconstruction)
+            q_ls, k_ls, v_ls = qc_s, kc_s, vc_s
+            
+            # Lt: Qt attends to source Ks, Vs  
+            q_lt, k_lt, v_lt = qc_t, kc_s, vc_s  # Use source K,V
+            
+            # Lm: Use source Qs, Ks with own Vm
+            q_lm, k_lm, v_lm = qc_s, kc_s, vc_m  # Use source Q,K, own V
+            
+            q_rearranged = torch.cat([q_ls, q_lt, q_lm])
+            k_rearranged = torch.cat([k_ls, k_lt, k_lm])
+            v_rearranged = torch.cat([v_ls, v_lt, v_lm])
+
+        return q_rearranged, k_rearranged, v_rearranged
+
+    def attn_forward(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ):
+        cur_transformer_layer = self.cur_att_layer // 2
+        residual = hidden_states
+
+        is_cross = True if encoder_hidden_states is not None else False
+
+        if len(args) > 0 or kwargs.get("scale", None) is not None:
+            deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+            deprecate("scale", "1.0.0", deprecation_message)
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states, *args)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states, *args)
+        value = attn.to_v(encoder_hidden_states, *args)
+
+        # Apply three-path editability control for self-attention
+        if not is_cross and self.cur_step in self.step_idx and cur_transformer_layer in self.layer_idx:
+            query, key, value = self.masactrl_editability_forward(query, key, value)
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
